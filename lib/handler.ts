@@ -60,6 +60,7 @@ export const handler = async (event: any) => {
         })
       );
 
+      // APL方式（アスペクト比制御可能）
       const response = {
         version: '1.0',
         response: {
@@ -69,12 +70,21 @@ export const handler = async (event: any) => {
           },
           directives: [
             {
-              type: 'VideoApp.Launch',
-              videoItem: {
-                source: videoUrls[0],
-                metadata: {
-                  title: 'ポモドーロタイマー',
-                  subtitle: `再生中: ${mp4Files[0]}`,
+              type: 'Alexa.Presentation.APL.RenderDocument',
+              document: {
+                type: 'APL',
+                version: '1.8',
+                mainTemplate: {
+                  item: {
+                    type: 'Video',
+                    width: '100vw',
+                    height: '100vh',
+                    source: videoUrls[0],
+                    scale: 'best-fit', // アスペクト比維持
+                    autoplay: true,
+                    audioTrack: 'foreground',
+                    backgroundColor: 'black',
+                  },
                 },
               },
             },
