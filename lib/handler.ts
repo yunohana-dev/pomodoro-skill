@@ -15,6 +15,247 @@ declare const console: {
 
 const s3Client = new S3Client({ region: process.env.AWS_REGION || 'ap-northeast-1' });
 
+// S3からMP4ファイル一覧を取得
+async function getMp4Files(): Promise<string[]> {
+  const bucketName = process.env.BUCKET_NAME;
+  const command = new ListObjectsV2Command({
+    Bucket: bucketName!,
+    Prefix: '',
+  });
+
+  const objects = await s3Client.send(command);
+  const mp4Files = objects.Contents
+    ?.filter(obj => obj.Key!.toLowerCase().endsWith('.mp4'))
+    .sort((a, b) => a.Key!.localeCompare(b.Key!))
+    .map(obj => obj.Key!) || [];
+
+  console.log(`Found MP4 files:`, mp4Files);
+  return mp4Files;
+}
+
+// S3からPresigned URLを生成
+async function generatePresignedUrl(fileKey: string): Promise<string> {
+  const bucketName = process.env.BUCKET_NAME;
+  const getCommand = new GetObjectCommand({
+    Bucket: bucketName!,
+    Key: fileKey,
+  });
+  return await getSignedUrl(s3Client, getCommand, { expiresIn: 3600 });
+}
+
+// APL Video documentを生成
+function createVideoDocument(videoUrl: string, currentIndex: number) {
+  return {
+    type: 'APL',
+    version: '1.8',
+    mainTemplate: {
+      parameters: ['videoData'],
+      item: {
+        type: 'Video',
+        id: 'pomodoroVideo',
+        width: '100vw',
+        height: '100vh',
+        source: videoUrl,
+        scale: 'best-fit',
+        autoplay: true,
+        audioTrack: 'foreground',
+        backgroundColor: 'black',
+        onEnd: [{
+          type: 'SendEvent',
+          arguments: ['videoEnd', '${videoData.currentIndex}'],
+        }],
+      },
+    },
+  };
+}
+
+// Alexaレスポンスを生成するヘルパー関数
+function createAlexaResponse(config: {
+  outputSpeech?: string;
+  shouldEndSession: boolean;
+  directives?: any[];
+  sessionAttributes?: any;
+}): any {
+  const response: any = {
+    version: '1.0',
+    response: {
+      shouldEndSession: config.shouldEndSession,
+    },
+  };
+
+  if (config.outputSpeech) {
+    response.response.outputSpeech = {
+      type: 'PlainText',
+      text: config.outputSpeech,
+    };
+  }
+
+  if (config.directives) {
+    response.response.directives = config.directives;
+  }
+
+  if (config.sessionAttributes) {
+    response.sessionAttributes = config.sessionAttributes;
+  }
+
+  return response;
+}
+
+// エラーハンドリング
+function handleError(context: string, error: any): any {
+  console.error(`Error in ${context} processing:`, error);
+  console.error(`${context} Error stack:`, error instanceof Error ? error.stack : 'No stack trace');
+
+  const errorResponse = createAlexaResponse({
+    outputSpeech: context === 'Launch' ? 'エラーが発生しました。もう一度お試しください。' : undefined,
+    shouldEndSession: true,
+  });
+
+  console.log(`=== ${context.toUpperCase()} ERROR RESPONSE ===`);
+  console.log(JSON.stringify(errorResponse, null, 2));
+  return errorResponse;
+}
+
+// LaunchRequestを処理
+async function handleLaunchRequest(): Promise<any> {
+  try {
+    console.log(`=== LAUNCH REQUEST ===`);
+
+    const mp4Files = await getMp4Files();
+    console.log(`Found MP4 files for launch:`, mp4Files);
+
+    if (mp4Files.length === 0) {
+      console.log('No MP4 files found');
+      return createAlexaResponse({
+        outputSpeech: 'ポモドーロ用の動画ファイルが見つかりません。',
+        shouldEndSession: true,
+      });
+    }
+
+    const firstVideoUrl = await generatePresignedUrl(mp4Files[0]);
+    console.log(`First video URL: ${firstVideoUrl}`);
+
+    const response = createAlexaResponse({
+      outputSpeech: 'ポモドーロを開始します。',
+      shouldEndSession: false,
+      directives: [{
+        type: 'Alexa.Presentation.APL.RenderDocument',
+        document: createVideoDocument(firstVideoUrl, 0),
+        datasources: {
+          videoData: {
+            currentIndex: 0,
+          }
+        },
+      }],
+      sessionAttributes: {
+        mp4Files: mp4Files,
+        totalVideos: mp4Files.length
+      },
+    });
+
+    console.log('=== LAUNCH RESPONSE ===');
+    console.log(JSON.stringify(response, null, 2));
+    return response;
+
+  } catch (error) {
+    return handleError('Launch', error);
+  }
+}
+
+// APL UserEventを処理
+async function handleUserEvent(event: any): Promise<any> {
+  const userEventType = event.request.arguments?.[0];
+  const currentIndexArg = event.request.arguments?.[1];
+
+  console.log(`=== PROCESSING USER EVENT ===`);
+  console.log(`UserEvent Type: ${userEventType}`);
+  console.log(`Current Index Argument:`, currentIndexArg);
+  console.log(`Arguments Array:`, event.request.arguments);
+  console.log(`Comparing userEventType: "${userEventType}" === "videoEnd": ${userEventType === 'videoEnd'}`);
+
+  if (userEventType !== 'videoEnd') {
+    console.log(`=== USER EVENT TYPE NOT MATCHED ===`);
+    console.log(`Expected: "videoEnd", Received: "${userEventType}"`);
+    console.log(`Event will not be processed`);
+
+    console.log(`=== USER EVENT PROCESSING COMPLETE ===`);
+    return createAlexaResponse({
+      shouldEndSession: false,
+    });
+  }
+
+  try {
+    console.log(`=== VIDEO END EVENT DETECTED ===`);
+
+    let currentIndex = 0;
+    if (typeof currentIndexArg === 'number') {
+      currentIndex = currentIndexArg;
+    } else if (typeof currentIndexArg === 'string') {
+      currentIndex = parseInt(currentIndexArg, 10) || 0;
+    } else if (typeof currentIndexArg === 'object' && currentIndexArg !== null) {
+      currentIndex = currentIndexArg.value || currentIndexArg.currentIndex || 0;
+    }
+    console.log(`Current Index: ${currentIndex}`);
+
+    const nextIndex = currentIndex + 1;
+    console.log(`Next Index: ${nextIndex}`);
+
+    const mp4Files = await getMp4Files();
+    console.log(`Re-fetched MP4 files from S3:`, mp4Files);
+    console.log(`Total videos: ${mp4Files.length}`);
+
+    // 最後の動画を再生し終えた場合はスキルを終了
+    if (nextIndex >= mp4Files.length) {
+      console.log(`=== PLAYLIST COMPLETED ===`);
+      console.log(`All ${mp4Files.length} videos have been played`);
+
+      const response = createAlexaResponse({
+        outputSpeech: 'ポモドーロセッションが完了しました。お疲れ様でした。',
+        shouldEndSession: true,
+      });
+
+      console.log('=== PLAYLIST END RESPONSE ===');
+      console.log(JSON.stringify(response, null, 2));
+      return response;
+    }
+
+    const nextVideoKey = mp4Files[nextIndex];
+    console.log(`Next Video Key: ${nextVideoKey}`);
+
+    if (!nextVideoKey) {
+      throw new Error(`No video found at index ${nextIndex}`);
+    }
+
+    const nextVideoUrl = await generatePresignedUrl(nextVideoKey);
+    console.log(`Next Video URL: ${nextVideoUrl}`);
+
+    const response = {
+      version: '1.0',
+      response: {
+        directives: [{
+          type: 'Alexa.Presentation.APL.RenderDocument',
+          document: createVideoDocument(nextVideoUrl, nextIndex),
+          datasources: {
+            videoData: {
+              currentIndex: nextIndex,
+            }
+          },
+        }],
+      },
+      sessionAttributes: {
+        mp4Files: mp4Files,
+        totalVideos: mp4Files.length
+      },
+    };
+    console.log('=== VIDEO SWITCH RESPONSE ===');
+    console.log(JSON.stringify(response, null, 2));
+    return response;
+
+  } catch (error) {
+    return handleError('UserEvent', error);
+  }
+}
+
 export const handler = async (event: any) => {
   console.log('=== FULL REQUEST ===');
   console.log(JSON.stringify(event, null, 2));
@@ -25,293 +266,27 @@ export const handler = async (event: any) => {
   console.log(`Request Type: ${requestType}`);
   console.log(`Intent Name: ${intentName}`);
 
-  // APL UserEventを処理（動画終了時の次の動画再生）
-  if (requestType === 'Alexa.Presentation.APL.UserEvent') {
-    const userEventType = event.request.arguments?.[0];
-    const currentIndexArg = event.request.arguments?.[1];
-
-    console.log(`=== PROCESSING USER EVENT ===`);
-    console.log(`UserEvent Type: ${userEventType}`);
-    console.log(`Current Index Argument:`, currentIndexArg);
-    console.log(`Arguments Array:`, event.request.arguments);
-
-    console.log(`Comparing userEventType: "${userEventType}" === "videoEnd": ${userEventType === 'videoEnd'}`);
-
-    if (userEventType === 'videoEnd') {
-      console.log(`=== VIDEO END EVENT DETECTED ===`);
-      try {
-        const bucketName = process.env.BUCKET_NAME;
-        console.log(`Bucket Name: ${bucketName}`);
-
-        const command = new ListObjectsV2Command({
-          Bucket: bucketName!,
-          Prefix: '',
-        });
-
-        const objects = await s3Client.send(command);
-        const mp4Files = objects.Contents
-          ?.filter(obj => obj.Key!.toLowerCase().endsWith('.mp4'))
-          .sort((a, b) => a.Key!.localeCompare(b.Key!))
-          .map(obj => obj.Key!) || [];
-
-        console.log(`Found MP4 files:`, mp4Files);
-
-        // currentIndexArgから現在のインデックスを取得
-        let currentIndex = 0;
-        if (typeof currentIndexArg === 'number') {
-          currentIndex = currentIndexArg;
-        } else if (typeof currentIndexArg === 'string') {
-          currentIndex = parseInt(currentIndexArg, 10) || 0;
-        } else if (typeof currentIndexArg === 'object' && currentIndexArg !== null) {
-          // オブジェクトの場合、様々なプロパティをチェック
-          currentIndex = currentIndexArg.value || currentIndexArg.currentIndex || 0;
-        }
-
-        console.log(`Current Index: ${currentIndex}`);
-
-        const nextIndex = currentIndex + 1;
-        console.log(`Next Index: ${nextIndex}`);
-        console.log(`Total videos: ${mp4Files.length}`);
-
-        // 最後の動画を再生し終えた場合はスキルを終了
-        if (nextIndex >= mp4Files.length) {
-          console.log(`=== PLAYLIST COMPLETED ===`);
-          console.log(`All ${mp4Files.length} videos have been played`);
-
-          const endResponse = {
-            version: '1.0',
-            response: {
-              outputSpeech: {
-                type: 'PlainText',
-                text: 'ポモドーロセッションが完了しました。お疲れ様でした。',
-              },
-              shouldEndSession: true,
-            },
-          };
-          console.log('=== PLAYLIST END RESPONSE ===');
-          console.log(JSON.stringify(endResponse, null, 2));
-          return endResponse;
-        }
-
-        console.log(`Next Video Key: ${mp4Files[nextIndex]}`);
-
-        if (!mp4Files[nextIndex]) {
-          throw new Error(`No video found at index ${nextIndex}`);
-        }
-
-        const getCommand = new GetObjectCommand({
-          Bucket: bucketName!,
-          Key: mp4Files[nextIndex],
-        });
-        const nextVideoUrl = await getSignedUrl(s3Client, getCommand, { expiresIn: 3600 });
-        console.log(`Next Video URL: ${nextVideoUrl}`);
-
-        const aplToken = event.context['Alexa.Presentation.APL']?.token;
-        console.log(`APL Token from context: "${aplToken}"`);
-        console.log(`Token is empty: ${!aplToken}`);
-
-        // RenderDocumentで新しいビデオを完全にレンダリング
-        const renderDirective = {
-          type: 'Alexa.Presentation.APL.RenderDocument',
-          document: {
-            type: 'APL',
-            version: '1.8',
-            mainTemplate: {
-              parameters: [
-                'videoData'
-              ],
-              item: {
-                type: 'Video',
-                id: 'pomodoroVideo',
-                width: '100vw',
-                height: '100vh',
-                source: nextVideoUrl,
-                scale: 'best-fit',
-                autoplay: true,
-                audioTrack: 'foreground',
-                backgroundColor: 'black',
-                onEnd: [
-                  {
-                    type: 'SendEvent',
-                    arguments: ['videoEnd', '${videoData.currentIndex}'],
-                  },
-                ],
-              },
-            },
-          },
-          datasources: {
-            videoData: {
-              currentIndex: nextIndex
-            }
-          },
-        };
-
-        const response = {
-          version: '1.0',
-          response: {
-            directives: [renderDirective],
-          },
-        };
-
-        console.log('=== VIDEO SWITCH RESPONSE ===');
-        console.log(JSON.stringify(response, null, 2));
-        return response;
-      } catch (error) {
-        console.error('Error loading next video:', error);
-        console.error('Error stack:', error instanceof Error ? error.stack : 'No stack trace');
-
-        const errorResponse = {
-          version: '1.0',
-          response: {
-            shouldEndSession: true,
-          },
-        };
-        console.log('=== ERROR RESPONSE ===');
-        console.log(JSON.stringify(errorResponse, null, 2));
-        return errorResponse;
-      }
-    } else {
-      console.log(`=== USER EVENT TYPE NOT MATCHED ===`);
-      console.log(`Expected: "videoEnd", Received: "${userEventType}"`);
-      console.log(`Event will not be processed`);
+  try {
+    // APL UserEventを処理
+    if (requestType === 'Alexa.Presentation.APL.UserEvent') {
+      return await handleUserEvent(event);
     }
 
-    console.log(`=== USER EVENT PROCESSING COMPLETE ===`);
-    return {
-      version: '1.0',
-      response: {
-        shouldEndSession: false,
-      },
-    };
-  }
-
-  if (requestType === 'LaunchRequest' || intentName === 'StartPomodoroIntent') {
-    try {
-      const bucketName = process.env.BUCKET_NAME;
-      console.log(`=== LAUNCH REQUEST ===`);
-      console.log(`Bucket Name: ${bucketName}`);
-
-      const command = new ListObjectsV2Command({
-        Bucket: bucketName!,
-        Prefix: '',
-      });
-
-      const objects = await s3Client.send(command);
-      const mp4Files = objects.Contents
-        ?.filter(obj => obj.Key!.toLowerCase().endsWith('.mp4'))
-        .sort((a, b) => a.Key!.localeCompare(b.Key!))
-        .map(obj => obj.Key!) || [];
-
-      console.log(`Found MP4 files for launch:`, mp4Files);
-
-      if (mp4Files.length === 0) {
-        console.log('No MP4 files found');
-        return {
-          version: '1.0',
-          response: {
-            outputSpeech: {
-              type: 'PlainText',
-              text: 'ポモドーロ用の動画ファイルが見つかりません。',
-            },
-            shouldEndSession: true,
-          },
-        };
-      }
-
-      const videoUrls = await Promise.all(
-        mp4Files.map(async (key) => {
-          const getCommand = new GetObjectCommand({
-            Bucket: bucketName!,
-            Key: key,
-          });
-          const url = await getSignedUrl(s3Client, getCommand, { expiresIn: 3600 });
-          return url;
-        })
-      );
-
-      console.log(`Generated ${videoUrls.length} video URLs`);
-      console.log(`First video URL: ${videoUrls[0]}`);
-
-      // APL方式（アスペクト比制御可能）
-      const response = {
-        version: '1.0',
-        response: {
-          outputSpeech: {
-            type: 'PlainText',
-            text: 'ポモドーロを開始します。',
-          },
-          directives: [
-            {
-              type: 'Alexa.Presentation.APL.RenderDocument',
-              document: {
-                type: 'APL',
-                version: '1.8',
-                mainTemplate: {
-                  parameters: [
-                    'videoData'
-                  ],
-                  item: {
-                    type: 'Video',
-                    id: 'pomodoroVideo',
-                    width: '100vw',
-                    height: '100vh',
-                    source: videoUrls[0],
-                    scale: 'best-fit',
-                    autoplay: true,
-                    audioTrack: 'foreground',
-                    backgroundColor: 'black',
-                    onEnd: [
-                      {
-                        type: 'SendEvent',
-                        arguments: ['videoEnd', '${videoData.currentIndex}'],
-                      },
-                    ],
-                  },
-                },
-              },
-              datasources: {
-                videoData: {
-                  currentIndex: 0
-                }
-              },
-            },
-          ],
-        },
-      };
-
-      console.log('=== LAUNCH RESPONSE ===');
-      console.log(JSON.stringify(response, null, 2));
-      return response;
-    } catch (error) {
-      console.error('Launch Error:', error);
-      console.error('Launch Error stack:', error instanceof Error ? error.stack : 'No stack trace');
-      const errorResponse = {
-        version: '1.0',
-        response: {
-          outputSpeech: {
-            type: 'PlainText',
-            text: 'エラーが発生しました。もう一度お試しください。',
-          },
-          shouldEndSession: true,
-        },
-      };
-      console.log('=== LAUNCH ERROR RESPONSE ===');
-      console.log(JSON.stringify(errorResponse, null, 2));
-      return errorResponse;
+    // LaunchRequestを処理
+    if (requestType === 'LaunchRequest' || intentName === 'StartPomodoroIntent') {
+      return await handleLaunchRequest();
     }
-  }
 
-  const defaultResponse = {
-    version: '1.0',
-    response: {
-      outputSpeech: {
-        type: 'PlainText',
-        text: 'こんにちは。ポモドーロと言ってください。',
-      },
+    // デフォルトレスポンス
+    const defaultResponse = createAlexaResponse({
+      outputSpeech: 'こんにちは。ポモドーロと言ってください。',
       shouldEndSession: false,
-    },
-  };
-  console.log('=== DEFAULT RESPONSE ===');
-  console.log(JSON.stringify(defaultResponse, null, 2));
-  return defaultResponse;
+    });
+    console.log('=== DEFAULT RESPONSE ===');
+    console.log(JSON.stringify(defaultResponse, null, 2));
+    return defaultResponse;
+
+  } catch (error) {
+    return handleError('Handler', error);
+  }
 };
